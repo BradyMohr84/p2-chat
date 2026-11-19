@@ -5,14 +5,28 @@
 #include <arpa/inet.h>
 #include "port_utils.h"
 #include <pthread.h>
+#include <signal.h>
+#include <sys/socket.h>
 
 #define BUFFER_SIZE 1024
+#define MAX_CLIENTS 64
+#define MAX_NAME 32
+
+typedef struct  {
+    char name[MAX_NAME];
+    int sock;
+    int active;
+} Client;
+
+Client client_list[MAX_CLIENTS];
+pthread_mutex_t client_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void *chat(void* arg)
 {
     char buffer[BUFFER_SIZE];
     int n;
-    int client_fd = (int) arg;
+    int sock_slot = (int) arg;
+    int client_fd = client_list[sock_slot].sock;
     // Chat loop: Handle the currently connected client
         while (1) {
             memset(buffer, 0, BUFFER_SIZE);
@@ -32,7 +46,11 @@ void *chat(void* arg)
         }
         // Close the current client connection
         printf("[*] Client disconnected. Cleaning up socket.\n");
+        pthread_mutex_lock(&client_lock);
         close(client_fd);
+        client_list[sock_slot].active = 0;
+        client_list[sock_slot].name[0] = '\0';
+        pthread_mutex_unlock(&client_lock);
         pthread_exit(0);
 }
 
@@ -40,6 +58,7 @@ int main(int argc, char *argv[]) {
     int server_fd, client_fd;
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_size;
+    
     
     
     int port;
@@ -100,16 +119,41 @@ int main(int argc, char *argv[]) {
             continue; // Keep server alive even if a single accept fails
         }
 
+        //when a client connects, save its information to the list of clients
+        int slot = -1;
+        pthread_mutex_lock(&client_lock);
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (client_list[i].active == 0) {
+                client_list[i].sock = client_fd;
+                client_list[i].active = 1;
+                client_list[i].name[0] = '\0'; 
+                slot = i;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&client_lock);
+        if (slot < 0) {
+            close(client_fd);
+            continue;
+        }
+
         printf("[+] Connected established with %s:%d\n",
                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
         //give this connection to a thread
         pthread_t tid;
-        pthread_create(&tid, NULL, chat, (void *)client_fd);
-
-        
+        int rc = pthread_create(&tid, NULL, chat, (void *)(intptr_t)slot);
+        if (rc != 0) {
+            fprintf(stderr, "[-] pthread_create failed: %s\n", strerror(rc));
+            pthread_mutex_lock(&client_lock);
+            client_list[slot].active = 0;
+            client_list[slot].name[0] = '\0';
+            pthread_mutex_unlock(&client_lock);
+            close(client_fd);
+            continue;
+        }
+        pthread_detach(tid);
     }
-
     // Unreachable code, but good practice
     close(server_fd);
     return 0;
