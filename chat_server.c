@@ -31,6 +31,60 @@ int send_line(int fd, const char *text)
     return write(fd, out, len) < 0 ? -1 : 0;
 }
 
+void broadcast(char *cmd_code, char *out_msg, int exclude_slot)
+{
+    //if the command is join 
+    if(strcmp("JOIN", cmd_code) == 0) 
+    {
+        //lock for shared data
+        pthread_mutex_lock(&client_lock);
+        for(int i = 0; i < MAX_CLIENTS; i++)
+        {
+            //send to all clients that are active and have joined
+            if(client_list[i].active && client_list[i].name[0] != '\0')
+            {
+                send_line(client_list[i].sock, out_msg);
+            }
+        }
+         pthread_mutex_unlock(&client_lock);
+    }
+    else if (strcmp(cmd_code, "MSG") == 0 || strcmp(cmd_code, "LEAVE") == 0)
+    {
+        //lock for global data
+        pthread_mutex_lock(&client_lock);
+        for (int i = 0; i < MAX_CLIENTS; i++)
+        {
+            //send the msessage only if the client is active, has joined, and is not the sending client
+            if (client_list[i].active && client_list[i].name[0] != '\0' && i != exclude_slot)
+            {
+                send_line(client_list[i].sock, out_msg);
+            }
+        }
+        pthread_mutex_unlock(&client_lock);
+    }
+    
+
+}
+
+void handle_who(int fd)
+{
+    char reply[BUFFER_SIZE];
+    int len = snprintf(reply, sizeof(reply), "GROUP");
+    //lock for global data
+    pthread_mutex_lock(&client_lock);
+    for(int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if(client_list[i].active && client_list[i].name[0] != '\0')
+        {
+            int n = snprintf(reply + len, sizeof(reply) - len," %s", client_list[i].name);
+            if (n < 0 || n >= (int)(sizeof(reply) - len)) break;  // if the buffer is out of room 
+            len += n;
+        } 
+    }
+    pthread_mutex_unlock(&client_lock);
+    send_line(fd, reply);
+}
+
 int read_line(int fd, char *buf, int *len, char *line, int line_size)
 {
     while(1)
@@ -62,6 +116,33 @@ int read_line(int fd, char *buf, int *len, char *line, int line_size)
     }
 }
 
+int handle_join(int slot, char *name)
+{
+    //if name is empty or has spaces reject it
+    if(strlen(name) == 0 || strstr(name, " ") ||strlen(name) >= MAX_NAME) return -1;
+    pthread_mutex_lock(&client_lock); // touches shared data so lock
+    
+    // if the location this client is destined for has a name
+    // do not allow it to join
+    if (client_list[slot].name[0] != '\0') 
+    {
+        pthread_mutex_unlock(&client_lock);
+        return -1;
+    }
+    for(int i = 0; i < MAX_CLIENTS; i++)
+    {
+        //if slot is in use and the name is taken
+        if(client_list[i].active && strcmp(name, client_list[i].name) == 0) 
+        {
+            pthread_mutex_unlock(&client_lock);
+            return -1; 
+        }
+    }
+    snprintf(client_list[slot].name, MAX_NAME, "%s", name);
+    pthread_mutex_unlock(&client_lock);
+    return 0;     
+}
+
 void *chat(void* arg)
 {
     int sock_slot = (int)(intptr_t) arg;
@@ -71,10 +152,95 @@ void *chat(void* arg)
     char line[BUFFER_SIZE];
     while (read_line(client_fd, buf, &buf_len, line, sizeof(line)) >= 0)
         {
-        printf("[->] %s\n", line);
+            char *cmd = line; // the command
+            char *arg = ""; //the argument for the given command 
+            char *space = strchr(line, ' '); //find the space between command and the name of the client
+            if(space != NULL)
+            {
+                *space = '\0'; //make cmd only be the command
+                arg = space + 1; // arg becomes the username
+            }
+
+            if(strcmp("JOIN", cmd) == 0) 
+            {
+                if (handle_join(sock_slot, arg) == 0) { //if the client joined
+                    send_line(client_fd, "OK"); //Tell it join was OK
+
+                    char out[BUFFER_SIZE];
+                    snprintf(out, sizeof(out), "JOIN %s", arg); 
+                    broadcast(cmd, out, -1); //Tell all other clients someone has joined
+                }
+                else {
+                    send_line(client_fd, "BADNAME");
+                }
+            }
+            //if client asked WHO
+            else if(strcmp("WHO", cmd) == 0)
+            {
+                handle_who(client_fd);
+            }
+            else if (strcmp(cmd, "MSG") == 0)
+            {
+                //get the name of the client that is sending a message
+                char myname[MAX_NAME];
+                pthread_mutex_lock(&client_lock);
+                snprintf(myname, sizeof(myname), "%s", client_list[sock_slot].name);
+                pthread_mutex_unlock(&client_lock);
+
+                //if the sending client has not joined
+                if (myname[0] == '\0')
+                {
+                    send_line(client_fd, "ERROR must JOIN first");
+                }
+                //if the message is empty
+                else if (arg[0] == '\0')
+                {
+                    send_line(client_fd, "ERROR empty message");
+                }
+                else
+                {
+                    char out[BUFFER_SIZE];
+                    //create the string to send out
+                    int n = snprintf(out, sizeof(out), "MSG %s %s", myname, arg);
+                    if (n >= (int)sizeof(out))
+                    {
+                        send_line(client_fd, "ERROR message too long");
+                    }
+                    else
+                    {
+                        send_line(client_fd, "OK");
+                        broadcast(cmd, out, sock_slot);
+                    }
+                }
+
+            } 
+            else if(strcmp(cmd, "LEAVE") == 0)
+            {
+                send_line(client_fd, "OK");
+                break;
+            }
+            else
+            {
+                send_line(client_fd, "ERROR command not recognized"); 
+            } 
+        
         }
         // Close the current client connection
         printf("[*] Client disconnected. Cleaning up socket.\n");
+
+        //global data lock needed
+        char myname[MAX_NAME];
+        pthread_mutex_lock(&client_lock);
+        snprintf(myname, sizeof(myname), "%s", client_list[sock_slot].name);
+        pthread_mutex_unlock(&client_lock);
+
+        //Only brodcast if the leaving client has joined
+        if (myname[0] != '\0')
+        {
+            char out[BUFFER_SIZE];
+            snprintf(out, sizeof(out), "LEAVE %s", myname);
+            broadcast("LEAVE", out, sock_slot);   // takes the lock itself
+        }
 
         //lock the thread so issues with the global array do not happen when
         //a client disconnects
